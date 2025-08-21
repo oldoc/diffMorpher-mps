@@ -81,21 +81,30 @@ def tokenize_prompt(tokenizer, prompt, tokenizer_max_length=None):
 
     return text_inputs
 
-def encode_prompt(text_encoder, input_ids, attention_mask, text_encoder_use_attention_mask=False):
-    text_input_ids = input_ids.to(text_encoder.device)
+def encode_prompt(tokenizer, text_encoder, prompts, max_length=77):
+    device = next(text_encoder.parameters()).device
 
-    if text_encoder_use_attention_mask:
-        attention_mask = attention_mask.to(text_encoder.device)
-    else:
-        attention_mask = None
-
-    prompt_embeds = text_encoder(
-        text_input_ids,
-        attention_mask=attention_mask,
+    text_inputs = tokenizer(
+        prompts, padding="max_length", max_length=max_length, return_tensors="pt"
     )
-    prompt_embeds = prompt_embeds[0]
+    ids = text_inputs.input_ids.to(device)
+
+    if device.type == "mps":
+        text_encoder = text_encoder.to(device, dtype=torch.float32)
+    else:
+        text_encoder = text_encoder.to(device)
+
+    # 只在 cuda/cpu 上用 autocast
+    ctx = (
+        torch.autocast(device_type=device.type, enabled=False)
+        if device.type in ("cuda", "cpu") else
+        contextlib.nullcontext()
+    )
+    with ctx:
+        prompt_embeds = text_encoder(ids)[0]   # float32 (MPS) / 默认精度 (CUDA/CPU)
 
     return prompt_embeds
+
 
 # model_path: path of the model
 # image: input image, have not been pre-processed
@@ -138,7 +147,7 @@ def train_lora(image, prompt, save_lora_dir, model_path=None, tokenizer=None, te
         )
 
     # set device and dtype
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("mps")
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
@@ -208,6 +217,9 @@ def train_lora(image, prompt, save_lora_dir, model_path=None, tokenizer=None, te
             text_inputs.attention_mask,
             text_encoder_use_attention_mask=False
         )
+        unet_device = next(unet.parameters()).device
+        unet_dtype  = next(unet.parameters()).dtype
+        text_embedding = text_embedding.to(unet_device, unet_dtype)
 
     if type(image) == np.ndarray:
         image = Image.fromarray(image)

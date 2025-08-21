@@ -29,56 +29,55 @@ def get_img(img, resolution=512):
     return img.unsqueeze(0)
 
 @torch.no_grad()
-def slerp(p0, p1, fract_mixing: float, adain=True):
-    r""" Copied from lunarring/latentblending
-    Helper function to correctly mix two random variables using spherical interpolation.
-    The function will always cast up to float64 for sake of extra 4.
-    Args:
-        p0: 
-            First tensor for interpolation
-        p1: 
-            Second tensor for interpolation
-        fract_mixing: float 
-            Mixing coefficient of interval [0, 1]. 
-            0 will return in p0
-            1 will return in p1
-            0.x will return a mix between both preserving angular velocity.
+def slerp(p0: torch.Tensor, p1: torch.Tensor, t, use_adain=False, eps: float = 1e-7):
     """
-    if p0.dtype == torch.float16:
-        recast_to = 'fp16'
+    Spherical interpolation between p0 and p1.
+    p0, p1: (..., D) tensors
+    t: float or 0..1 tensor broadcastable to p0[..., :1]
+    """
+    device = p0.device
+    in_dtype = p0.dtype
+
+    # 工作精度：MPS 下固定 float32；其他设备保持在 16/32/bfloat16 中
+    if device.type == "mps":
+        work_dtype = torch.float32
     else:
-        recast_to = 'fp32'
+        work_dtype = in_dtype if in_dtype in (torch.float16, torch.float32, torch.bfloat16) else torch.float32
 
-    p0 = p0.double()
-    p1 = p1.double()
+    p0 = p0.to(device=device, dtype=work_dtype)
+    p1 = p1.to(device=device, dtype=work_dtype)
 
-    if adain:
-        mean1, std1 = calc_mean_std(p0)
-        mean2, std2 = calc_mean_std(p1)
-        mean = mean1 * (1 - fract_mixing) + mean2 * fract_mixing
-        std = std1 * (1 - fract_mixing) + std2 * fract_mixing
-        
-    norm = torch.linalg.norm(p0) * torch.linalg.norm(p1)
-    epsilon = 1e-7
-    dot = torch.sum(p0 * p1) / norm
-    dot = dot.clamp(-1+epsilon, 1-epsilon)
+    # 归一化避免数值问题
+    p0n = F.normalize(p0, dim=-1, eps=eps)
+    p1n = F.normalize(p1, dim=-1, eps=eps)
 
-    theta_0 = torch.arccos(dot)
-    sin_theta_0 = torch.sin(theta_0)
-    theta_t = theta_0 * fract_mixing
-    s0 = torch.sin(theta_0 - theta_t) / sin_theta_0
-    s1 = torch.sin(theta_t) / sin_theta_0
-    interp = p0*s0 + p1*s1
+    # t 统一成张量
+    if not torch.is_tensor(t):
+        t = torch.tensor(t, device=device, dtype=work_dtype)
+    t = t.to(device=device, dtype=work_dtype)
 
-    if adain:
-        interp = F.instance_norm(interp) * std + mean
+    # 余弦与夹角
+    dot = (p0n * p1n).sum(dim=-1).clamp(-1.0 + eps, 1.0 - eps)
+    omega = torch.acos(dot)
+    sin_omega = torch.sin(omega)
 
-    if recast_to == 'fp16':
-        interp = interp.half()
-    elif recast_to == 'fp32':
-        interp = interp.float()
+    # 当两向量几乎平行时退化为线性插值
+    mask = (sin_omega.abs() > 1e-4).unsqueeze(-1)
 
-    return interp
+    # 为了广播，把 t 变成和最后一维匹配
+    t_exp = t.view(*([1] * (p0.dim() - 1)), 1)
+
+    out_slerp = (torch.sin((1 - t_exp) * omega.unsqueeze(-1)) / sin_omega.unsqueeze(-1)) * p0 + \
+                (torch.sin(t_exp * omega.unsqueeze(-1)) / sin_omega.unsqueeze(-1)) * p1
+    out_lerp = (1 - t_exp) * p0 + t_exp * p1
+
+    out = torch.where(mask, out_slerp, out_lerp)
+
+    # 如果你在别处用 AdaIN，可在这里加分支（保持 fp32/mps 兼容）
+    # if use_adain:
+    #     out = your_adain(out, ...)
+
+    return out.to(in_dtype)
 
 
 def do_replace_attn(key: str):

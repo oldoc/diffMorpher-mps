@@ -14,6 +14,7 @@ from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
 from diffusers import StableDiffusionPipeline
 from argparse import ArgumentParser
 import inspect
+import contextlib
 
 from utils.model_utils import get_img, slerp, do_replace_attn
 from utils.lora_utils import train_lora, load_lora
@@ -155,7 +156,7 @@ class DiffMorpherPipeline(StableDiffusionPipeline):
         invert a real image into noise map with determinisc DDIM inversion
         """
         DEVICE = torch.device(
-            "cuda") if torch.cuda.is_available() else torch.device("cpu")
+            "cuda") if torch.cuda.is_available() else torch.device("mps")
         batch_size = image.shape[0]
         if isinstance(prompt, list):
             if batch_size == 1:
@@ -170,8 +171,31 @@ class DiffMorpherPipeline(StableDiffusionPipeline):
             padding="max_length",
             max_length=77,
             return_tensors="pt"
+        ).to("mps")
+
+        #text_embeddings = self.text_encoder(text_input.input_ids.to(DEVICE))[0]
+        
+        device = next(self.unet.parameters()).device
+        text_input_ids = text_input.input_ids.to(device)
+
+        # MPS 下让 text_encoder 用 float32，避免 LayerNorm half 报错
+        if device.type == "mps":
+            self.text_encoder.to(device, dtype=torch.float32)
+        else:
+            self.text_encoder.to(device)
+
+        # 只在 cuda/cpu 上开 autocast；mps 用空上下文
+        ctx = (
+            torch.autocast(device_type=device.type, enabled=False)
+            if device.type in ("cuda", "cpu") else
+            contextlib.nullcontext()
         )
-        text_embeddings = self.text_encoder(text_input.input_ids.to(DEVICE))[0]
+        with ctx:
+            text_embeddings = self.text_encoder(text_input_ids)[0]
+
+        # 与 UNet 保持相同精度（UNet 若是 fp16，这里会转成 fp16）
+        text_embeddings = text_embeddings.to(next(self.unet.parameters()).dtype)
+
         print("input text embeddings :", text_embeddings.shape)
         # define initial latents
         latents = self.image2latent(image)
@@ -223,7 +247,11 @@ class DiffMorpherPipeline(StableDiffusionPipeline):
     @torch.no_grad()
     def ddim_inversion(self, latent, cond):
         timesteps = reversed(self.scheduler.timesteps)
-        with torch.autocast(device_type='cuda', dtype=torch.float32):
+
+        #with torch.autocast(device_type='mps', dtype=torch.float32):
+        ctx = torch.autocast("cuda", dtype=torch.float16) if torch.cuda.is_available() else contextlib.nullcontext()
+
+        with ctx:
             for i, t in enumerate(tqdm.tqdm(timesteps, desc="DDIM inversion")):
                 cond_batch = cond.repeat(latent.shape[0], 1, 1)
 
@@ -271,7 +299,7 @@ class DiffMorpherPipeline(StableDiffusionPipeline):
     @torch.no_grad()
     def image2latent(self, image):
         DEVICE = torch.device(
-            "cuda") if torch.cuda.is_available() else torch.device("cpu")
+            "cuda") if torch.cuda.is_available() else torch.device("mps")
         if type(image) is Image:
             image = np.array(image)
             image = torch.from_numpy(image).float() / 127.5 - 1
@@ -343,7 +371,7 @@ class DiffMorpherPipeline(StableDiffusionPipeline):
     @torch.no_grad()
     def get_text_embeddings(self, prompt, guidance_scale, neg_prompt, batch_size):
         DEVICE = torch.device(
-            "cuda") if torch.cuda.is_available() else torch.device("cpu")
+            "cuda") if torch.cuda.is_available() else torch.device("mps")
         # text embeddings
         text_input = self.tokenizer(
             prompt,
@@ -351,7 +379,28 @@ class DiffMorpherPipeline(StableDiffusionPipeline):
             max_length=77,
             return_tensors="pt"
         )
-        text_embeddings = self.text_encoder(text_input.input_ids.cuda())[0]
+        #text_embeddings = self.text_encoder(text_input.input_ids.to("mps"))[0]
+
+        device = next(self.unet.parameters()).device
+        text_input_ids = text_input.input_ids.to(device)
+
+        # MPS 下让 text_encoder 用 float32，避免 LayerNorm half 报错
+        if device.type == "mps":
+            self.text_encoder.to(device, dtype=torch.float32)
+        else:
+            self.text_encoder.to(device)
+
+        # 只在 cuda/cpu 上开 autocast；mps 用空上下文
+        ctx = (
+            torch.autocast(device_type=device.type, enabled=False)
+            if device.type in ("cuda", "cpu") else
+            contextlib.nullcontext()
+        )
+        with ctx:
+            text_embeddings = self.text_encoder(text_input_ids)[0]
+
+        # 与 UNet 保持相同精度（UNet 若是 fp16，这里会转成 fp16）
+        text_embeddings = text_embeddings.to(next(self.unet.parameters()).dtype)
 
         if guidance_scale > 1.:
             if neg_prompt:
@@ -438,9 +487,9 @@ class DiffMorpherPipeline(StableDiffusionPipeline):
             print(f"Load from {load_lora_path_0}.")
             if load_lora_path_0.endswith(".safetensors"):
                 lora_0 = safetensors.torch.load_file(
-                    load_lora_path_0, device="cpu")
+                    load_lora_path_0, device="mps")
             else:
-                lora_0 = torch.load(load_lora_path_0, map_location="cpu")
+                lora_0 = torch.load(load_lora_path_0, map_location="mps")
 
             if not load_lora_path_1:
                 weight_name = f"{output_path.split('/')[-1]}_lora_1.ckpt"
@@ -451,9 +500,9 @@ class DiffMorpherPipeline(StableDiffusionPipeline):
             print(f"Load from {load_lora_path_1}.")
             if load_lora_path_1.endswith(".safetensors"):
                 lora_1 = safetensors.torch.load_file(
-                    load_lora_path_1, device="cpu")
+                    load_lora_path_1, device="mps")
             else:
-                lora_1 = torch.load(load_lora_path_1, map_location="cpu")
+                lora_1 = torch.load(load_lora_path_1, map_location="mps")
         else:
             lora_0 = lora_1 = None
 
